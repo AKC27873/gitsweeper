@@ -56,8 +56,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-// ---------- repo discovery ----------
-
 fn find_repos(root: &Path, max_depth: usize) -> Vec<PathBuf> {
     let mut repos = Vec::new();
     let mut walker = WalkDir::new(root).max_depth(max_depth).into_iter();
@@ -83,8 +81,6 @@ fn find_repos(root: &Path, max_depth: usize) -> Vec<PathBuf> {
     repos
 }
 
-// ---------- git helpers ----------
-
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -108,7 +104,6 @@ fn dirty_count(repo: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// (ahead, behind) relative to the upstream branch, or None if there is no upstream.
 fn ahead_behind(repo: &Path) -> Option<(u32, u32)> {
     let out = git(
         repo,
@@ -148,8 +143,6 @@ fn display_name(repo: &Path) -> String {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| repo.display().to_string())
 }
-
-// ---------- commands ----------
 
 fn status(repos: &[PathBuf], fetch: bool) {
     let rows: Vec<_> = repos
