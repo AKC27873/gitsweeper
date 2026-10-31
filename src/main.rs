@@ -914,9 +914,6 @@ fn file_list(files: &[String]) -> String {
     s
 }
 
-=======
->>>>>>> main
->>>>>>> dev
 #[derive(PartialEq)]
 enum Reason {
     Merged,
