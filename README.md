@@ -1,11 +1,11 @@
-# gitsweep
+# gitsweeper
 
-Keep a folder full of Git repos tidy. `gitsweep` finds every repository under a
+Keep a folder full of Git repos tidy. `gitsweeper` finds every repository under a
 directory and lets you check, sync, clean up and search them all at once, in
 parallel, with colored output that makes problems easy to spot.
 
 ```
-$ gitsweep status
+$ gitsweeper status
 REPO      BRANCH  CHANGES   SYNC            STASH  LAST COMMIT
 api       main    clean     ↓2                     3h ago
 cli       main    clean     up to date             2d ago
@@ -28,15 +28,15 @@ cargo install --path .
 ## Usage
 
 ```sh
-gitsweep [OPTIONS] <COMMAND>
+gitsweeper [OPTIONS] <COMMAND>
 ```
 
-By default `gitsweep` scans the current directory, three levels deep. Point it
-somewhere else with `-C`, or set `GITSWEEP_ROOT` once in your shell profile:
+By default `gitsweeper` scans the current directory, three levels deep. Point it
+somewhere else with `-C`, or set `gitsweeper_ROOT` once in your shell profile:
 
 ```sh
-gitsweep -C ~/code status
-export GITSWEEP_ROOT=~/code   # then just: gitsweep status
+gitsweeper -C ~/code status
+export gitsweeper_ROOT=~/code   # then just: gitsweeper status
 ```
 
 Hidden directories, `node_modules` and `target` are skipped, and it doesn't
@@ -62,7 +62,7 @@ to the root, so `work/cli` and `cli` stay distinct.
 | `exec -- CMD...` | Run any program in every repo |
 | `list` (`ls`) | Print the full path of every repo found |
 
-Run `gitsweep <command> --help` for each command's options.
+Run `gitsweeper <command> --help` for each command's options.
 
 ### Global options
 
@@ -70,7 +70,7 @@ These work with every command:
 
 | Option | Description |
 |---|---|
-| `-C, --root <DIR>` | Folder to scan (default `.`, or `$GITSWEEP_ROOT`) |
+| `-C, --root <DIR>` | Folder to scan (default `.`, or `$gitsweeper_ROOT`) |
 | `--depth <N>` | How many directory levels deep to search (default `3`) |
 | `-f, --filter <TEXT>` | Only include repos whose path contains `TEXT` (repeatable) |
 | `-x, --exclude <TEXT>` | Skip repos whose path contains `TEXT` (repeatable) |
@@ -84,9 +84,9 @@ Filters are case-insensitive. Several `-f` values match any of them; `-x` always
 ### `status`
 
 ```sh
-gitsweep status            # every repo
-gitsweep status --fetch    # fetch first so ahead/behind is current
-gitsweep status -d         # only repos that need attention
+gitsweeper status            # every repo
+gitsweeper status --fetch    # fetch first so ahead/behind is current
+gitsweeper status -d         # only repos that need attention
 ```
 
 The **CHANGES** column breaks changes down: `+` staged, `~` modified,
@@ -98,8 +98,8 @@ dirty, out of sync (including no upstream), have stashes, or hit an error.
 ### `fetch`
 
 ```sh
-gitsweep fetch           # git fetch --all in every repo
-gitsweep fetch --prune   # also drop remote-tracking branches deleted on the remote
+gitsweeper fetch           # git fetch --all in every repo
+gitsweeper fetch --prune   # also drop remote-tracking branches deleted on the remote
 ```
 
 Reports how many commits are waiting to be pulled in each repo.
@@ -114,25 +114,25 @@ a pull. Repos that have diverged are reported as needing a merge or rebase.
 ### `add`
 
 ```sh
-gitsweep add                 # stage everything, including new files (git add -A)
-gitsweep add -u              # only changes to files git already tracks
-gitsweep add src/ Cargo.lock # only these paths, in every repo that has them
-gitsweep add -n              # dry run: show what would be staged
+gitsweeper add                 # stage everything, including new files (git add -A)
+gitsweeper add -u              # only changes to files git already tracks
+gitsweeper add src/ Cargo.lock # only these paths, in every repo that has them
+gitsweeper add -n              # dry run: show what would be staged
 ```
 
 Paths are relative to each repo's root. Repos where the path doesn't exist are
 left alone. Each repo lists the files it staged, so you can see what went in.
-Changed your mind? `gitsweep run restore --staged .` unstages everything.
+Changed your mind? `gitsweeper run restore --staged .` unstages everything.
 
 ### `commit`
 
 ```sh
-gitsweep commit -m "Bump deps"                    # dry run: what would be committed
-gitsweep commit -m "Bump deps" --yes              # commit what's staged
-gitsweep commit -am "Bump deps" --yes             # also include unstaged changes to tracked files
-gitsweep commit -um "Bump deps" --yes             # also include new files (implies -a)
-gitsweep commit -am "Bump deps" --yes --push      # commit, then push
-gitsweep -f service- commit -am "Fix CI" --yes    # only repos with "service-" in their path
+gitsweeper commit -m "Bump deps"                    # dry run: what would be committed
+gitsweeper commit -m "Bump deps" --yes              # commit what's staged
+gitsweeper commit -am "Bump deps" --yes             # also include unstaged changes to tracked files
+gitsweeper commit -um "Bump deps" --yes             # also include new files (implies -a)
+gitsweeper commit -am "Bump deps" --yes --push      # commit, then push
+gitsweeper -f service- commit -am "Fix CI" --yes    # only repos with "service-" in their path
 ```
 
 | Option | Description |
@@ -157,8 +157,8 @@ no upstream are committed but not pushed.
 ### `push`
 
 ```sh
-gitsweep push         # show what would be pushed
-gitsweep push --yes   # actually push
+gitsweeper push         # show what would be pushed
+gitsweeper push --yes   # actually push
 ```
 
 Only repos that are ahead get pushed. Repos that are also behind are skipped
@@ -167,8 +167,8 @@ with a reminder to pull first.
 ### `switch`
 
 ```sh
-gitsweep switch release/2.0   # switch every repo that has this branch
-gitsweep switch               # put every repo back on its default branch
+gitsweeper switch release/2.0   # switch every repo that has this branch
+gitsweeper switch               # put every repo back on its default branch
 ```
 
 Repos with uncommitted changes are skipped, and repos without the branch
@@ -178,10 +178,10 @@ Repos with uncommitted changes are skipped, and repos without the branch
 ### `prune`
 
 ```sh
-gitsweep prune                       # dry run: list merged branches
-gitsweep prune --yes                 # delete them
-gitsweep prune --gone                # also include branches whose remote was deleted
-gitsweep prune --gone --yes --force  # delete those too, even if git calls them unmerged
+gitsweeper prune                       # dry run: list merged branches
+gitsweeper prune --yes                 # delete them
+gitsweeper prune --gone                # also include branches whose remote was deleted
+gitsweeper prune --gone --yes --force  # delete those too, even if git calls them unmerged
 ```
 
 The current branch and the default branch are never touched. Deletion uses
@@ -197,8 +197,8 @@ current branch and showing ahead/behind, upstream and age.
 ### `recent`
 
 ```sh
-gitsweep recent        # 20 most recently active repos
-gitsweep recent -n 5
+gitsweeper recent        # 20 most recently active repos
+gitsweeper recent -n 5
 ```
 
 Shows when, which branch, who and the commit subject. Handy for "what was I
@@ -207,9 +207,9 @@ working on?"
 ### `grep`
 
 ```sh
-gitsweep grep TODO
-gitsweep grep -i 'fixme|hack'   # case-insensitive
-gitsweep grep -l unwrap         # only file names
+gitsweeper grep TODO
+gitsweeper grep -i 'fixme|hack'   # case-insensitive
+gitsweeper grep -l unwrap         # only file names
 ```
 
 Searches tracked files only, skipping binaries. Results are prefixed with the
@@ -218,22 +218,22 @@ repo name.
 ### `run` and `exec`
 
 ```sh
-gitsweep run log -1 --oneline
-gitsweep run remote -v
-gitsweep exec -- cargo check
-gitsweep exec -- sh -c 'ls | wc -l'
+gitsweeper run log -1 --oneline
+gitsweeper run remote -v
+gitsweeper exec -- cargo check
+gitsweeper exec -- sh -c 'ls | wc -l'
 ```
 
 `run` passes its arguments to `git` in each repo; `exec` runs any program with
 each repo as the working directory. Commands run in parallel and output is
 grouped per repo. Repos that print nothing are counted rather than listed.
-Put `--` before the command so its flags aren't read as `gitsweep` options.
+Put `--` before the command so its flags aren't read as `gitsweeper` options.
 
 ### `list`
 
 ```sh
-gitsweep list
-cd "$(gitsweep list | fzf)"
+gitsweeper list
+cd "$(gitsweeper list | fzf)"
 ```
 
 Prints one absolute path per line, with no color or headers.
@@ -261,7 +261,7 @@ needing credentials fails and the rest carry on.
 |---|---|
 | `0` | Everything succeeded |
 | `1` | At least one repo failed (a pull, push, command, etc.) |
-| `2` | `gitsweep` itself couldn't run (bad root folder, program not found) |
+| `2` | `gitsweeper` itself couldn't run (bad root folder, program not found) |
 
 ## Upgrading from 0.1
 
@@ -269,7 +269,7 @@ The root folder is now a flag instead of a positional argument, because a
 positional argument would clash with `grep PATTERN` and `run ARGS`:
 
 ```sh
-gitsweep ~/code status      # 0.1
-gitsweep -C ~/code status   # 0.2
+gitsweeper ~/code status      # 0.1
+gitsweeper -C ~/code status   # 0.2
 ```
 
