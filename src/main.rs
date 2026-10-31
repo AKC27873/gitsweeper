@@ -51,6 +51,28 @@ enum Cmd {
         #[arg(short, long)]
         dirty: bool,
     },
+    Add {
+        paths: Vec<String>,
+        #[arg(short, long)]
+        update: bool,
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+    },
+    #[command(visible_alias = "ci")]
+    Commit {
+        #[arg(short, long, required = true)]
+        message: String,
+        #[arg(short, long)]
+        all: bool,
+        #[arg(short, long)]
+        untracked: bool,
+        #[arg(long)]
+        push: bool,
+        #[arg(long)]
+        no_verify: bool,
+        #[arg(long)]
+        yes: bool,
+    },
     Fetch {
         #[arg(long)]
         prune: bool,
