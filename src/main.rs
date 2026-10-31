@@ -138,6 +138,29 @@ fn run(cli: Cli) -> Result<usize> {
 
     Ok(match cli.cmd {
         Cmd::Status { fetch, dirty } => cmd_status(&repos, fetch, dirty),
+        Cmd::Add {
+            paths,
+            update,
+            dry_run,
+        } => cmd_add(&repos, &paths, update, dry_run),
+        Cmd::Commit {
+            message,
+            all,
+            untracked,
+            push,
+            no_verify,
+            yes,
+        } => {
+            let opts = CommitOpts {
+                message: &message,
+                all: all || untracked,
+                untracked,
+                push,
+                no_verify,
+                yes,
+            };
+            cmd_commit(&repos, &opts)
+        }
         Cmd::Fetch { prune } => cmd_fetch(&repos, prune),
         Cmd::Pull => cmd_pull(&repos),
         Cmd::Push { yes } => cmd_push(&repos, yes),
@@ -701,6 +724,199 @@ fn cmd_switch(repos: &[Repo], target: Option<&str>) -> usize {
     print_outcomes(&results, ["switched", "unchanged", "", "skipped", "failed"])
 }
 
+<<<<<<< HEAD
+=======
+<<<<<<< HEAD
+fn cmd_add(repos: &[Repo], paths: &[String], update: bool, dry_run: bool) -> usize {
+    let label = if dry_run { "Checking" } else { "Staging" };
+    let results = in_parallel(repos, label, |r| {
+        let run = |preview: bool| {
+            let mut a = vec!["add", if update { "-u" } else { "-A" }];
+            if preview {
+                a.push("--dry-run");
+            }
+            a.push("--");
+            a.extend(paths.iter().map(String::as_str));
+            git(&r.path, &a)
+        };
+        let preview = match run(true) {
+            Ok(out) => out,
+            Err(e) => {
+                let msg = short_err(&e);
+                return if msg.contains("did not match any files") {
+                    Outcome::noop("no matching files")
+                } else {
+                    Outcome::failed(msg)
+                };
+            }
+        };
+        let files: Vec<String> = preview.lines().filter_map(parse_add_line).collect();
+        if files.is_empty() {
+            return Outcome::noop("nothing to add");
+        }
+        if dry_run {
+            return Outcome::planned(format!("would stage {}", file_list(&files)));
+        }
+        match run(false) {
+            Ok(_) => Outcome::done(format!("staged {}", file_list(&files))),
+            Err(e) => Outcome::failed(short_err(&e)),
+        }
+    });
+    let failures = print_outcomes(
+        &results,
+        ["Staged", "nothing to add", "to stage", "skipped", "failed"],
+    );
+    if dry_run && results.iter().any(|(_, o)| o.kind == Kind::Planned) {
+        println!(
+            "{}",
+            "Dry run - re-run without --dry-run to stage the changes.".dimmed()
+        );
+    }
+    failures
+}
+
+fn parse_add_line(line: &str) -> Option<String> {
+    let (_, rest) = line.split_once(' ')?;
+    Some(rest.trim_matches('\'').to_string())
+}
+
+struct CommitOpts<'a> {
+    message: &'a str,
+    all: bool,
+    untracked: bool,
+    push: bool,
+    no_verify: bool,
+    yes: bool,
+}
+
+fn files_to_commit(repo: &Path, o: &CommitOpts) -> Result<Vec<String>> {
+    let mut cmds: Vec<&[&str]> = vec![&["diff", "--cached", "--name-only"]];
+    if o.all {
+        cmds.push(&["diff", "--name-only"]);
+    }
+    if o.untracked {
+        cmds.push(&["ls-files", "--others", "--exclude-standard"]);
+    }
+    let mut files = Vec::new();
+    for args in cmds {
+        for f in git(repo, args)?.lines() {
+            if !f.is_empty() && !files.iter().any(|x| x == f) {
+                files.push(f.to_string());
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn cmd_commit(repos: &[Repo], o: &CommitOpts) -> usize {
+    let label = if o.yes { "Commiting" } else { "Checking" };
+    let results = in_parallel(repos, label, |r| commit_one(&r.path, o));
+    let mut labels = [
+        "commited",
+        "nothing to commit",
+        "to commit",
+        "skipped",
+        "failed",
+    ];
+    if o.push && o.yes {
+        labels[0] = "committed & pushed";
+    }
+    let failures = print_outcomes(&results, labels);
+    if !o.yes && results.iter().any(|(_, x)| x.kind == Kind::Planned) {
+        let msg = format!(
+            "Dry run - re-run with --yes to commit as \"{}\".",
+            truncate(o.message, 50)
+        );
+        println!("{}", msg.dimmed());
+    }
+    failures
+}
+
+fn commit_one(path: &Path, o: &CommitOpts) -> Outcome {
+    let st = match read_status(path) {
+        Ok(s) => s,
+        Err(e) => return Outcome::failed(short_err(&e)),
+    };
+    if st.conflicts > 0 {
+        return Outcome::skipped(format!("{} unresolved conflicts", st.conflicts));
+    }
+    if st.detached {
+        return Outcome::skipped("detached HEAD");
+    }
+    let files = match files_to_commit(path, o) {
+        Ok(f) => f,
+        Err(e) => return Outcome::failed(short_err(&e)),
+    };
+    if files.is_empty() {
+        let hint = match (o.all, st.modified, st.untracked) {
+            (false, m, _) if m > 0 => format!(" — {} not staged (add -a)", plural(m, "change")),
+            (_, _, u) if u > 0 && !o.untracked => {
+                format!(" — {} untracked (add -u)", plural(u, "file"))
+            }
+            _ => String::new(),
+        };
+        return Outcome::noop(format!("nothing to commit{hint}"));
+    }
+    if !o.yes {
+        let mut msg = format!("would commit {}", file_list(&files));
+        if o.push {
+            msg += " and push";
+        }
+        return Outcome::planned(msg);
+    }
+
+    let stage: &[&str] = if o.untracked {
+        &["add", "-A"]
+    } else if o.all {
+        &["add", "-u"]
+    } else {
+        &[]
+    };
+    if !stage.is_empty()
+        && let Err(e) = git(path, stage)
+    {
+        return Outcome::failed(format!("couldn't stage: {}", short_err(&e)));
+    }
+    let mut args = vec!["commit", "--quiet", "-m", o.message];
+    if o.no_verify {
+        args.push("--no-verify");
+    }
+    if let Err(e) = git(path, &args) {
+        return Outcome::failed(format!("commit failed: {}", short_err(&e)));
+    }
+    let sha = git(path, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
+    let done = format!("committed {sha} · {}", plural(files.len(), "file"));
+
+    if !o.push {
+        return Outcome::done(done);
+    }
+    match read_status(path).map(|s| s.sync) {
+        Ok(SyncState::Tracking { behind: 0, .. }) => match git(path, &["push", "--quiet"]) {
+            Ok(_) => Outcome::done(format!("{done} · pushed")),
+            Err(e) => Outcome::failed(format!("{done}, but push failed: {}", short_err(&e))),
+        },
+        Ok(SyncState::Tracking { behind, .. }) => Outcome::skipped(format!(
+            "{done} · not pushed: behind by {behind}, pull first"
+        )),
+        Ok(SyncState::NoUpstream) => Outcome::skipped(format!("{done} · not pushed: no upstream")),
+        Ok(SyncState::Gone) => Outcome::skipped(format!("{done} · not pushed: upstream deleted")),
+        Err(e) => Outcome::failed(format!("{done}, but push failed: {}", short_err(&e))),
+    }
+}
+
+fn file_list(files: &[String]) -> String {
+    const SHOW: usize = 3;
+    let names: Vec<&str> = files.iter().take(SHOW).map(String::as_str).collect();
+    let mut s = format!("{}: {}", plural(files.len(), "file"), names.join(", "));
+    if files.len() > SHOW {
+        s += &format!(" +{} more", files.len() - SHOW)
+    }
+    s
+}
+
+=======
+>>>>>>> main
+>>>>>>> dev
 #[derive(PartialEq)]
 enum Reason {
     Merged,
