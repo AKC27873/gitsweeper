@@ -724,9 +724,6 @@ fn cmd_switch(repos: &[Repo], target: Option<&str>) -> usize {
     print_outcomes(&results, ["switched", "unchanged", "", "skipped", "failed"])
 }
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
 fn cmd_add(repos: &[Repo], paths: &[String], update: bool, dry_run: bool) -> usize {
     let label = if dry_run { "Checking" } else { "Staging" };
     let results = in_parallel(repos, label, |r| {
