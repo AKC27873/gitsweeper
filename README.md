@@ -273,3 +273,12 @@ gitsweeper ~/code status      # 0.1
 gitsweeper -C ~/code status   # 0.2
 ```
 
+---------------
+
+## TO-DO List
+
+- [] Add pull request functionality for the repos
+- [] Add restore functionality
+- [] Add merge/merge branches functionality
+- [] Add diff functionality
+
