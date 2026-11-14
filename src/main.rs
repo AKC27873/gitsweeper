@@ -73,6 +73,45 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    Diff {
+        paths: Vec<String>,
+        #[arg(short, long, conflicts_with = "against")]
+        staged: bool,
+        #[arg(long, value_name = "REF")]
+        against: Option<String>,
+        #[arg(long)]
+        stat: bool,
+    },
+    Restore {
+        paths: Vec<String>,
+        #[arg(short, long, conflicts_with_all = ["all", "untracked"])]
+        staged: bool,
+        #[arg(short, long)]
+        all: bool,
+        #[arg(short, long)]
+        untracked: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    Merge {
+        branch: String,
+        #[arg(long, value_name = "BRANCH")]
+        into: Option<String>,
+        #[arg(long, conflicts_with = "no_ff")]
+        ff_only: bool,
+        #[arg(long)]
+        no_ff: bool,
+        #[arg(short, long)]
+        message: Option<String>,
+        #[arg(long)]
+        push: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    Pr {
+        #[command(subcommand)]
+        action: PrCmd,
+    },
     Fetch {
         #[arg(long)]
         prune: bool,
@@ -116,6 +155,27 @@ enum Cmd {
     },
     #[command(visible_alias = "ls")]
     List,
+}
+
+#[derive(Subcommand)]
+enum PrCmd {
+    #[command(visible_alias = "ls")]
+    List {
+        #[arg(long)]
+        mine: bool,
+    },
+    Create {
+        #[arg(short, long)]
+        title: Option<String>,
+        #[arg(short, long)]
+        body: Option<String>,
+        #[arg(long, value_name = "BRANCH")]
+        base: Option<String>,
+        #[arg(short, long)]
+        draft: bool,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -183,6 +243,49 @@ fn run(cli: Cli) -> Result<usize> {
             };
             cmd_commit(&repos, &opts)
         }
+        Cmd::Diff {
+            paths,
+            staged,
+            against,
+            stat,
+        } => cmd_diff(&repos, &paths, staged, against.as_deref(), stat),
+        Cmd::Restore {
+            paths,
+            staged,
+            all,
+            untracked,
+            yes,
+        } => {
+            let opts = RestoreOpts {
+                paths: &paths,
+                staged,
+                all,
+                untracked,
+                yes,
+            };
+            cmd_restore(&repos, &opts)
+        }
+        Cmd::Merge {
+            branch,
+            into,
+            ff_only,
+            no_ff,
+            message,
+            push,
+            yes,
+        } => {
+            let opts = MergeOpts {
+                branch: &branch,
+                into: into.as_deref(),
+                ff_only,
+                no_ff,
+                message: message.as_deref(),
+                push,
+                yes,
+            };
+            cmd_merge(&repos, &opts)
+        }
+        Cmd::Pr { action } => cmd_pr(&repos, &action)?,
         Cmd::Fetch { prune } => cmd_fetch(&repos, prune),
         Cmd::Pull => cmd_pull(&repos),
         Cmd::Push { yes } => cmd_push(&repos, yes),
@@ -933,6 +1036,872 @@ fn file_list(files: &[String]) -> String {
     s
 }
 
+// ───────────────────────────── diff / restore / merge / pr ─────────────────────────────
+
+/// Runs git with `-z` output and splits on NUL, so odd file names come back intact.
+fn git_files(repo: &Path, args: &[&str], paths: &[String]) -> Result<Vec<String>> {
+    let mut a = args.to_vec();
+    a.push("-z");
+    a.push("--");
+    a.extend(paths.iter().map(String::as_str));
+    let out = git_output(repo, &a)?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect())
+}
+
+/// True if `name` resolves to a commit (a local branch, `origin/main`, a tag, a SHA…).
+fn ref_exists(repo: &Path, name: &str) -> bool {
+    git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{name}^{{commit}}"),
+        ],
+    )
+    .is_ok()
+}
+
+fn count_commits(repo: &Path, range: &str) -> usize {
+    git(repo, &["rev-list", "--count", range])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+struct RepoDiff {
+    files: usize,
+    added: usize,
+    removed: usize,
+    body: String,
+    untracked: usize,
+}
+
+fn cmd_diff(
+    repos: &[Repo],
+    paths: &[String],
+    staged: bool,
+    against: Option<&str>,
+    stat: bool,
+) -> usize {
+    let color = colored::control::SHOULD_COLORIZE.should_colorize();
+    let results: Vec<(&Repo, Result<Option<RepoDiff>>)> = repos
+        .par_iter()
+        .map(|r| (r, diff_one(&r.path, paths, staged, against, stat, color)))
+        .collect();
+
+    let (mut files, mut added, mut removed, mut changed_repos, mut failures) = (0, 0, 0, 0, 0);
+    let mut missing_ref = 0;
+    let mut first = true;
+    for (r, res) in &results {
+        let d = match res {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                missing_ref += 1;
+                continue;
+            }
+            Err(e) => {
+                failures += 1;
+                eprintln!(
+                    "{} {}: {}",
+                    "✗".red().bold(),
+                    r.name.bold(),
+                    short_err(e).red()
+                );
+                continue;
+            }
+        };
+        if d.files == 0 && d.untracked == 0 {
+            continue;
+        }
+        if !first {
+            println!();
+        }
+        first = false;
+        let mut header = format!("{} {}", "▸".blue().bold(), r.name.bold());
+        if d.files > 0 {
+            changed_repos += 1;
+            files += d.files;
+            added += d.added;
+            removed += d.removed;
+            header += &format!(
+                "  {}  {} {}",
+                plural(d.files, "file").dimmed(),
+                format!("+{}", d.added).green(),
+                format!("−{}", d.removed).red()
+            );
+        }
+        println!("{header}");
+        if !d.body.is_empty() {
+            println!("{}", d.body);
+        }
+        if d.untracked > 0 {
+            let note = format!(
+                "· {} not shown (git diff only shows new files once they're added)",
+                plural(d.untracked, "untracked file")
+            );
+            println!("{}", note.dimmed());
+        }
+    }
+
+    if !first {
+        println!();
+    }
+    if files == 0 {
+        println!("{} {}", "✓".green().bold(), "No changes to show.".green());
+    } else {
+        println!(
+            "{} {} {}",
+            format!(
+                "{} changed in {} ·",
+                plural(files, "file"),
+                plural(changed_repos, "repo")
+            )
+            .bold(),
+            format!("+{added}").green().bold(),
+            format!("−{removed}").red().bold()
+        );
+    }
+    if let Some(r) = against
+        && missing_ref > 0
+    {
+        let note = format!("{} skipped: no {r} there", plural(missing_ref, "repo"));
+        println!("{}", note.dimmed());
+    }
+    failures
+}
+
+/// `Ok(None)` means the repo doesn't have the `--against` ref.
+fn diff_one(
+    path: &Path,
+    paths: &[String],
+    staged: bool,
+    against: Option<&str>,
+    stat: bool,
+    color: bool,
+) -> Result<Option<RepoDiff>> {
+    if let Some(r) = against
+        && !ref_exists(path, r)
+    {
+        return Ok(None);
+    }
+    let mut base = vec!["diff"];
+    if staged {
+        base.push("--cached");
+    }
+    if let Some(r) = against {
+        base.push(r);
+    }
+    fn args<'a>(base: &[&'a str], extra: &[&'a str], paths: &'a [String]) -> Vec<&'a str> {
+        let mut a = base.to_vec();
+        a.extend(extra);
+        a.push("--");
+        a.extend(paths.iter().map(String::as_str));
+        a
+    }
+    let with = |extra: &[&'static str]| args(&base, extra, paths);
+
+    // --numstat gives exact per-file line counts ("-" for binary files).
+    let numstat = git(path, &with(&["--numstat"]))?;
+    let (mut files, mut added, mut removed) = (0, 0, 0);
+    for line in numstat.lines() {
+        let mut f = line.split('\t');
+        files += 1;
+        added += f.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+        removed += f.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+    }
+
+    let body = if files == 0 {
+        String::new()
+    } else {
+        let color_flag = if color {
+            "--color=always"
+        } else {
+            "--color=never"
+        };
+        let mut extra = vec![color_flag];
+        if stat {
+            extra.push("--stat");
+        }
+        git(path, &with(&extra))?
+    };
+
+    // New files never appear in `git diff`, so count them to avoid surprises.
+    let untracked = if staged {
+        0
+    } else {
+        git_files(path, &["ls-files", "--others", "--exclude-standard"], paths)?.len()
+    };
+
+    Ok(Some(RepoDiff {
+        files,
+        added,
+        removed,
+        body,
+        untracked,
+    }))
+}
+
+// ── restore ──
+
+struct RestoreOpts<'a> {
+    paths: &'a [String],
+    staged: bool,
+    all: bool,
+    untracked: bool,
+    yes: bool,
+}
+
+fn cmd_restore(repos: &[Repo], o: &RestoreOpts) -> usize {
+    // Unstaging never loses work, so --staged runs straight away; discarding waits for --yes.
+    let apply = o.yes || o.staged;
+    let label = match (o.staged, apply) {
+        (true, _) => "Unstaging",
+        (false, true) => "Restoring",
+        (false, false) => "Checking",
+    };
+    let results = in_parallel(repos, label, |r| restore_one(&r.path, o, apply));
+    let labels = if o.staged {
+        ["unstaged", "nothing staged", "", "skipped", "failed"]
+    } else {
+        [
+            "restored",
+            "nothing to restore",
+            "to restore",
+            "skipped",
+            "failed",
+        ]
+    };
+    let failures = print_outcomes(&results, labels);
+    if !apply && results.iter().any(|(_, x)| x.kind == Kind::Planned) {
+        println!(
+            "{} {}",
+            "Dry run — re-run with --yes to discard these changes.".dimmed(),
+            "This can't be undone.".yellow()
+        );
+    }
+    failures
+}
+
+fn restore_one(path: &Path, o: &RestoreOpts, apply: bool) -> Outcome {
+    let p = o.paths;
+    let list = |args: &[&str]| git_files(path, args, p);
+    let gather = || -> Result<_> {
+        let staged = list(&["diff", "--cached", "--name-only"])?;
+        // Files that are staged but brand new (not in the last commit).
+        let staged_new = list(&["diff", "--cached", "--name-only", "--diff-filter=A"])?;
+        let unstaged = list(&["diff", "--name-only"])?;
+        let untracked = list(&["ls-files", "--others", "--exclude-standard"])?;
+        Ok((staged, staged_new, unstaged, untracked))
+    };
+    let (staged, staged_new, unstaged, untracked) = match gather() {
+        Ok(x) => x,
+        Err(e) => return Outcome::failed(short_err(&e)),
+    };
+    let has_head = head(path).is_some();
+
+    // ── --staged: just move staged changes back out of the index ──
+    if o.staged {
+        if staged.is_empty() {
+            return Outcome::noop("nothing staged");
+        }
+        let mut args = if has_head {
+            vec!["restore", "--staged", "--"]
+        } else {
+            vec!["rm", "--cached", "--quiet", "--"] // no commit yet to restore from
+        };
+        args.extend(staged.iter().map(String::as_str));
+        return match git(path, &args) {
+            Ok(_) => Outcome::done(format!("unstaged {}", file_list(&staged))),
+            Err(e) => Outcome::failed(short_err(&e)),
+        };
+    }
+
+    // ── discard: work out exactly which files get reset and deleted ──
+    let mut discard: Vec<String> = unstaged.clone();
+    if o.all {
+        for f in &staged {
+            if !discard.contains(f) {
+                discard.push(f.clone());
+            }
+        }
+    }
+    // A staged new file has no committed version to go back to. With --all it's unstaged
+    // and kept, unless --untracked asks for new files to be deleted too.
+    let unstage_new: Vec<String> = if o.all { staged_new.clone() } else { vec![] };
+    discard.retain(|f| !unstage_new.contains(f));
+    let mut delete: Vec<String> = vec![];
+    if o.untracked {
+        delete = untracked.clone();
+        delete.extend(unstage_new.iter().cloned());
+    }
+
+    if discard.is_empty() && delete.is_empty() && unstage_new.is_empty() {
+        let hint = if !o.all && !staged.is_empty() {
+            format!(" — {} staged (add --all)", plural(staged.len(), "file"))
+        } else if !o.untracked && !untracked.is_empty() {
+            format!(" — {} untracked (add -u)", plural(untracked.len(), "file"))
+        } else {
+            String::new()
+        };
+        return Outcome::noop(format!("nothing to restore{hint}"));
+    }
+    if !has_head && !discard.is_empty() {
+        return Outcome::skipped("no commits yet — nothing to restore to");
+    }
+
+    // Each step as (what we'd do, what we did), so the dry run and the result read naturally.
+    let mut steps: Vec<(String, String)> = vec![];
+    if !discard.is_empty() {
+        let f = file_list(&discard);
+        steps.push((format!("discard {f}"), format!("discarded {f}")));
+    }
+    let kept_new: Vec<String> = unstage_new
+        .iter()
+        .filter(|f| !delete.contains(f))
+        .cloned()
+        .collect();
+    if !kept_new.is_empty() {
+        let f = file_list(&kept_new);
+        steps.push((format!("unstage new {f}"), format!("unstaged new {f}")));
+    }
+    if !delete.is_empty() {
+        let f = file_list(&delete);
+        steps.push((
+            format!("delete untracked {f}"),
+            format!("deleted untracked {f}"),
+        ));
+    }
+    let join = |past: bool| {
+        steps
+            .iter()
+            .map(|(now, done)| if past { done.as_str() } else { now.as_str() })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    if !apply {
+        return Outcome::planned(format!("would {}", join(false)));
+    }
+
+    let run = |base: &[&str], files: &[String]| -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let mut a = base.to_vec();
+        a.extend(files.iter().map(String::as_str));
+        git(path, &a).map(|_| ())
+    };
+    let unstage: &[&str] = if has_head {
+        &["restore", "--staged", "--"]
+    } else {
+        &["rm", "--cached", "--quiet", "--"] // no commit yet to restore from
+    };
+    let result = run(unstage, &unstage_new)
+        .and_then(|_| {
+            // --source=HEAD with both flags resets index and file; without --all only the file.
+            if o.all {
+                run(
+                    &["restore", "--source=HEAD", "--staged", "--worktree", "--"],
+                    &discard,
+                )
+            } else {
+                run(&["restore", "--"], &discard)
+            }
+        })
+        .and_then(|_| run(&["clean", "--force", "--quiet", "--"], &delete));
+    match result {
+        Ok(_) => Outcome::done(join(true)),
+        Err(e) => Outcome::failed(short_err(&e)),
+    }
+}
+
+// ── merge ──
+
+struct MergeOpts<'a> {
+    branch: &'a str,
+    into: Option<&'a str>,
+    ff_only: bool,
+    no_ff: bool,
+    message: Option<&'a str>,
+    push: bool,
+    yes: bool,
+}
+
+fn cmd_merge(repos: &[Repo], o: &MergeOpts) -> usize {
+    let label = if o.yes { "Merging" } else { "Checking" };
+    let results = in_parallel(repos, label, |r| merge_one(&r.path, o));
+    let failures = print_outcomes(
+        &results,
+        [
+            "merged",
+            "nothing to merge",
+            "to merge",
+            "skipped",
+            "failed",
+        ],
+    );
+    if !o.yes && results.iter().any(|(_, x)| x.kind == Kind::Planned) {
+        println!("{}", "Dry run — re-run with --yes to merge.".dimmed());
+    }
+    failures
+}
+
+/// Asks git what a merge would do without touching any files (needs git 2.38+).
+/// Returns the conflicting files, or `None` if this git is too old to tell.
+fn predict_conflicts(repo: &Path, target: &str, branch: &str) -> Option<Vec<String>> {
+    let out = git_output(
+        repo,
+        &[
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            target,
+            branch,
+        ],
+    )
+    .ok()?;
+    match out.status.code() {
+        Some(0) => Some(vec![]),
+        // Exit 1 = conflicts: first line is a tree id, then one conflicted file per line.
+        Some(1) => Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .skip(1)
+                .take_while(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+fn merge_one(path: &Path, o: &MergeOpts) -> Outcome {
+    let st = match read_status(path) {
+        Ok(s) => s,
+        Err(e) => return Outcome::failed(short_err(&e)),
+    };
+    if !ref_exists(path, o.branch) {
+        return Outcome::noop(format!("no {} branch", o.branch));
+    }
+    if st.detached && o.into.is_none() {
+        return Outcome::skipped("detached HEAD");
+    }
+    let target = o.into.unwrap_or(&st.branch).to_string();
+    if o.into.is_some() && !local_branch_exists(path, &target) {
+        return Outcome::noop(format!("no {target} branch"));
+    }
+    if target == o.branch {
+        return Outcome::noop(format!("already on {target}"));
+    }
+    let n = count_commits(path, &format!("{target}..{}", o.branch));
+    if n == 0 {
+        return Outcome::noop(format!("{target} already has everything in {}", o.branch));
+    }
+    if st.conflicts > 0 {
+        return Outcome::skipped(format!("{} unresolved conflicts", st.conflicts));
+    }
+    if st.has_tracked_changes() {
+        return Outcome::skipped("uncommitted changes");
+    }
+
+    let can_ff = git(path, &["merge-base", "--is-ancestor", &target, o.branch]).is_ok();
+    if o.ff_only && !can_ff {
+        return Outcome::skipped(format!(
+            "{target} and {} have diverged — can't fast-forward",
+            o.branch
+        ));
+    }
+    let conflicts = predict_conflicts(path, &target, o.branch).unwrap_or_default();
+    if !conflicts.is_empty() {
+        return Outcome::skipped(format!(
+            "would conflict in {} — merge this one by hand",
+            file_list(&conflicts)
+        ));
+    }
+    let how = if can_ff && !o.no_ff {
+        "fast-forward"
+    } else {
+        "merge commit"
+    };
+    let what = format!(
+        "{} from {} into {target} ({how})",
+        plural(n, "commit"),
+        o.branch
+    );
+    if !o.yes {
+        let push = if o.push { " and push" } else { "" };
+        return Outcome::planned(format!("would merge {what}{push}"));
+    }
+
+    // Do the merge, switching to --into's branch first and back afterwards.
+    let switched = st.detached || st.branch != target;
+    if switched && let Err(e) = git(path, &["switch", "--quiet", &target]) {
+        return Outcome::failed(format!("couldn't switch to {target}: {}", short_err(&e)));
+    }
+    let mut args = vec!["merge", "--quiet", "--no-edit"];
+    if o.ff_only {
+        args.push("--ff-only");
+    }
+    if o.no_ff {
+        args.push("--no-ff");
+    }
+    if let Some(m) = o.message {
+        args.extend(["-m", m]);
+    }
+    args.push(o.branch);
+    let merged = git(path, &args);
+    if merged.is_err() {
+        // Never leave a repo half-merged.
+        let _ = git(path, &["merge", "--abort"]);
+    }
+    let back = if switched {
+        let orig = if st.detached {
+            st.branch.trim_start_matches('@').to_string()
+        } else {
+            st.branch.clone()
+        };
+        let mut a = vec!["switch", "--quiet"];
+        if st.detached {
+            a.push("--detach");
+        }
+        a.push(&orig);
+        git(path, &a).err().map(|_| format!(" · still on {target}"))
+    } else {
+        None
+    }
+    .unwrap_or_default();
+
+    if let Err(e) = merged {
+        return Outcome::failed(format!(
+            "merge failed, nothing changed: {}{back}",
+            merge_err(&e)
+        ));
+    }
+    let done = format!("merged {what}{back}");
+    if !o.push {
+        return Outcome::done(done);
+    }
+    push_branch(path, &target, done)
+}
+
+fn merge_err(e: &anyhow::Error) -> String {
+    let full = e.to_string();
+    if !full.contains("would be overwritten by merge") {
+        return short_err(e);
+    }
+    let files: Vec<String> = full
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .take_while(|l| !l.is_empty() && !l.starts_with("Please"))
+        .map(str::to_string)
+        .collect();
+    format!("it would overwrite {}", file_list(&files))
+}
+
+/// Pushes a local branch to its upstream, whether or not it's checked out.
+fn push_branch(path: &Path, branch: &str, done: String) -> Outcome {
+    let up = git(
+        path,
+        &[
+            "for-each-ref",
+            "--format=%(upstream:remotename)\t%(upstream:remoteref)",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .unwrap_or_default();
+    let Some((remote, remote_ref)) = up.split_once('\t').filter(|(r, _)| !r.is_empty()) else {
+        return Outcome::skipped(format!("{done} · not pushed: no upstream"));
+    };
+    match git(
+        path,
+        &["push", "--quiet", remote, &format!("{branch}:{remote_ref}")],
+    ) {
+        Ok(_) => Outcome::done(format!("{done} · pushed")),
+        Err(e) => Outcome::failed(format!("{done}, but push failed: {}", short_err(&e))),
+    }
+}
+
+fn gh(repo: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("gh")
+        .args(args)
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .context("failed to run gh")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        bail!(
+            "{}",
+            if stderr.is_empty() {
+                "gh failed".into()
+            } else {
+                stderr
+            }
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+fn not_on_github(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("known GitHub host") || s.contains("no git remotes")
+}
+
+fn cmd_pr(repos: &[Repo], action: &PrCmd) -> Result<usize> {
+    if Command::new("gh").arg("--version").output().is_err() {
+        bail!(
+            "the GitHub CLI (`gh`) isn't installed — get it from https://cli.github.com, then run `gh auth login`"
+        );
+    }
+    Ok(match action {
+        PrCmd::List { mine } => pr_list(repos, *mine),
+        PrCmd::Create {
+            title,
+            body,
+            base,
+            draft,
+            yes,
+        } => {
+            let opts = PrOpts {
+                title: title.as_deref(),
+                body: body.as_deref(),
+                base: base.as_deref(),
+                draft: *draft,
+                yes: *yes,
+            };
+            let label = if *yes { "Opening" } else { "Checking" };
+            let results = in_parallel(repos, label, |r| pr_create_one(&r.path, &opts));
+            let failures = print_outcomes(
+                &results,
+                ["opened", "no PR needed", "to open", "skipped", "failed"],
+            );
+            if !yes && results.iter().any(|(_, x)| x.kind == Kind::Planned) {
+                println!(
+                    "{}",
+                    "Dry run — re-run with --yes to push and open these PRs.".dimmed()
+                );
+            }
+            failures
+        }
+    })
+}
+
+fn pr_list(repos: &[Repo], mine: bool) -> usize {
+    let template = concat!(
+        r#"{{range .}}{{.number}}{{"\t"}}{{.isDraft}}{{"\t"}}{{.reviewDecision}}{{"\t"}}"#,
+        r#"{{.headRefName}}{{"\t"}}{{.author.login}}{{"\t"}}{{timeago .updatedAt}}{{"\t"}}"#,
+        r#"{{.title}}{{"\n"}}{{end}}"#
+    );
+    let progress = Progress::new("Listing", repos.len());
+    let results: Vec<(&Repo, Result<String>)> = repos
+        .par_iter()
+        .map(|r| {
+            let mut args = vec![
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--json",
+                "number,isDraft,reviewDecision,headRefName,author,updatedAt,title",
+                "--template",
+                template,
+            ];
+            if mine {
+                args.extend(["--author", "@me"]);
+            }
+            let out = gh(&r.path, &args);
+            progress.tick();
+            (r, out)
+        })
+        .collect();
+    progress.finish();
+
+    let mut table = Table::with_header(&[
+        "REPO", "PR", "TITLE", "BRANCH", "AUTHOR", "REVIEW", "UPDATED",
+    ]);
+    let (mut prs, mut with_prs, mut not_gh) = (0, 0, 0);
+    let mut errors = vec![];
+    for (r, res) in &results {
+        let out = match res {
+            Ok(o) => o,
+            Err(e) if not_on_github(e) => {
+                not_gh += 1;
+                continue;
+            }
+            Err(e) => {
+                errors.push((r, short_err(e)));
+                continue;
+            }
+        };
+        if !out.is_empty() {
+            with_prs += 1;
+        }
+        for line in out.lines() {
+            let f: Vec<&str> = line.splitn(7, '\t').collect();
+            let [num, draft, review, branch, author, updated, title] = f[..] else {
+                continue;
+            };
+            prs += 1;
+            let review = match (draft, review) {
+                ("true", _) => "draft".dimmed(),
+                (_, "APPROVED") => "approved".green(),
+                (_, "CHANGES_REQUESTED") => "changes requested".red(),
+                (_, "REVIEW_REQUIRED") => "needs review".yellow(),
+                _ => "".normal(),
+            };
+            table.add(vec![
+                r.name.bold().into(),
+                format!("#{num}").cyan().bold().into(),
+                truncate(title, 50).normal().into(),
+                truncate(branch, 25).cyan().into(),
+                author.blue().into(),
+                review.into(),
+                updated.dimmed().into(),
+            ]);
+        }
+    }
+    if prs > 0 {
+        table.print();
+        println!();
+    }
+    for (r, e) in &errors {
+        println!("{} {}  {}", "✗".red().bold(), r.name.bold(), e.red());
+    }
+    let mut parts = vec![if prs == 0 {
+        "No open pull requests".green().bold()
+    } else {
+        format!("{} in {}", plural(prs, "open PR"), plural(with_prs, "repo")).bold()
+    }];
+    if not_gh > 0 {
+        parts.push(format!("{not_gh} not on GitHub").dimmed());
+    }
+    if !errors.is_empty() {
+        parts.push(format!("{} failed", errors.len()).red().bold());
+    }
+    let sep = " · ".dimmed().to_string();
+    println!(
+        "{}",
+        parts
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(&sep)
+    );
+    errors.len()
+}
+
+struct PrOpts<'a> {
+    title: Option<&'a str>,
+    body: Option<&'a str>,
+    base: Option<&'a str>,
+    draft: bool,
+    yes: bool,
+}
+
+fn pr_create_one(path: &Path, o: &PrOpts) -> Outcome {
+    let st = match read_status(path) {
+        Ok(s) => s,
+        Err(e) => return Outcome::failed(short_err(&e)),
+    };
+    if st.detached {
+        return Outcome::skipped("detached HEAD");
+    }
+    let Some(base) = o.base.map(str::to_string).or_else(|| default_branch(path)) else {
+        return Outcome::skipped("can't tell which branch to target — use --base");
+    };
+    let branch = st.branch.clone();
+    if branch == base {
+        return Outcome::noop(format!("on {base} — switch to a feature branch first"));
+    }
+    let base_ref = if ref_exists(path, &format!("origin/{base}")) {
+        format!("origin/{base}")
+    } else {
+        base.clone()
+    };
+    if !ref_exists(path, &base_ref) {
+        return Outcome::skipped(format!("no {base} branch"));
+    }
+    let n = count_commits(path, &format!("{base_ref}..HEAD"));
+    if n == 0 {
+        return Outcome::noop(format!("{branch} has no commits that aren't on {base}"));
+    }
+
+    let existing = gh(
+        path,
+        &[
+            "pr", "list", "--head", &branch, "--state", "open", "--json", "url", "--jq", ".[0].url",
+        ],
+    );
+    match existing {
+        Ok(url) if !url.is_empty() => return Outcome::noop(format!("PR already open: {url}")),
+        Ok(_) => {}
+        Err(e) if not_on_github(&e) => return Outcome::noop("not on GitHub"),
+        Err(e) => return Outcome::failed(short_err(&e)),
+    }
+
+    let needs_push = match st.sync {
+        SyncState::Tracking { behind, .. } if behind > 0 => {
+            return Outcome::skipped(format!("{branch} is behind its upstream — pull first"));
+        }
+        SyncState::Tracking { ahead, .. } => ahead > 0,
+        SyncState::NoUpstream | SyncState::Gone => true,
+    };
+    let mut what = format!("{branch} → {base} · {}", plural(n, "commit"));
+    if o.draft {
+        what += " · draft";
+    }
+    if !o.yes {
+        let push = if needs_push {
+            " (pushes the branch first)"
+        } else {
+            ""
+        };
+        let mut msg = format!("would open PR {what}{push}");
+        if st.is_dirty() {
+            msg += " · uncommitted changes won't be included";
+        }
+        return Outcome::planned(msg);
+    }
+
+    if needs_push && let Err(e) = git(path, &["push", "--quiet", "-u", "origin", "HEAD"]) {
+        return Outcome::failed(format!("couldn't push {branch}: {}", short_err(&e)));
+    }
+    let mut args = vec!["pr", "create", "--base", &base, "--head", &branch];
+    if o.draft {
+        args.push("--draft");
+    }
+    let subject;
+    match (o.title, o.body) {
+        (None, None) => args.push("--fill"),
+        (title, body) => {
+            subject = match title {
+                Some(t) => t.to_string(),
+                None => git(path, &["log", "-1", "--format=%s"]).unwrap_or_default(),
+            };
+            args.extend(["--title", &subject, "--body", body.unwrap_or("")]);
+        }
+    }
+    match gh(path, &args) {
+        Ok(out) => {
+            let url = out.lines().last().unwrap_or("").trim();
+            Outcome::done(format!("opened {url} · {what}"))
+        }
+        Err(e) => Outcome::failed(short_err(&e)),
+    }
+}
+
 #[derive(PartialEq)]
 enum Reason {
     Merged,
@@ -1027,7 +1996,6 @@ fn cmd_prune(repos: &[Repo], delete: bool, gone: bool, force: bool) -> usize {
                 println!("  {} {}  {tag}", "→".cyan(), pad(branch, w).cyan());
                 continue;
             }
-            // -d (not -D) refuses to delete anything unmerged, as a safety net
             let flag = if force { "-D" } else { "-d" };
             match git(&plan.repo.path, &["branch", flag, branch]) {
                 Ok(_) => {
