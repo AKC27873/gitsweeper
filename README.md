@@ -263,22 +263,12 @@ needing credentials fails and the rest carry on.
 | `1` | At least one repo failed (a pull, push, command, etc.) |
 | `2` | `gitsweeper` itself couldn't run (bad root folder, program not found) |
 
-## Upgrading from 0.1
-
-The root folder is now a flag instead of a positional argument, because a
-positional argument would clash with `grep PATTERN` and `run ARGS`:
-
-```sh
-gitsweeper ~/code status      # 0.1
-gitsweeper -C ~/code status   # 0.2
-```
-
 ---------------
 
 ## TO-DO List
 
-- [] Add pull request functionality for the repos
-- [] Add restore functionality
-- [] Add merge/merge branches functionality
-- [] Add diff functionality
+- [x] Add pull request functionality for the repos
+- [x] Add restore functionality
+- [x] Add merge/merge branches functionality
+- [x] Add diff functionality
 
