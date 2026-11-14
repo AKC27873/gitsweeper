@@ -1593,7 +1593,6 @@ fn merge_one(path: &Path, o: &MergeOpts) -> Outcome {
     push_branch(path, &target, done)
 }
 
-/// git lists the files that block a merge on the lines after the error, so pick them up.
 fn merge_err(e: &anyhow::Error) -> String {
     let full = e.to_string();
     if !full.contains("would be overwritten by merge") {
@@ -1632,8 +1631,6 @@ fn push_branch(path: &Path, branch: &str, done: String) -> Outcome {
     }
 }
 
-// ── pull requests (GitHub CLI) ──
-
 fn gh(repo: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("gh")
         .args(args)
@@ -1657,7 +1654,6 @@ fn gh(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }
 
-/// gh's error when a repo has no GitHub remote — that's "not applicable", not a failure.
 fn not_on_github(e: &anyhow::Error) -> bool {
     let s = e.to_string();
     s.contains("known GitHub host") || s.contains("no git remotes")
@@ -1703,7 +1699,6 @@ fn cmd_pr(repos: &[Repo], action: &PrCmd) -> Result<usize> {
 }
 
 fn pr_list(repos: &[Repo], mine: bool) -> usize {
-    // A Go template keeps this dependency-free (no JSON crate needed).
     let template = concat!(
         r#"{{range .}}{{.number}}{{"\t"}}{{.isDraft}}{{"\t"}}{{.reviewDecision}}{{"\t"}}"#,
         r#"{{.headRefName}}{{"\t"}}{{.author.login}}{{"\t"}}{{timeago .updatedAt}}{{"\t"}}"#,
@@ -1830,7 +1825,6 @@ fn pr_create_one(path: &Path, o: &PrOpts) -> Outcome {
     if branch == base {
         return Outcome::noop(format!("on {base} — switch to a feature branch first"));
     }
-    // Compare against the remote's copy of the base when there is one.
     let base_ref = if ref_exists(path, &format!("origin/{base}")) {
         format!("origin/{base}")
     } else {
@@ -1888,7 +1882,6 @@ fn pr_create_one(path: &Path, o: &PrOpts) -> Outcome {
     if o.draft {
         args.push("--draft");
     }
-    // gh needs a title and body up front, since it can't ask in a parallel run.
     let subject;
     match (o.title, o.body) {
         (None, None) => args.push("--fill"),
@@ -2003,7 +1996,6 @@ fn cmd_prune(repos: &[Repo], delete: bool, gone: bool, force: bool) -> usize {
                 println!("  {} {}  {tag}", "→".cyan(), pad(branch, w).cyan());
                 continue;
             }
-            // -d (not -D) refuses to delete anything unmerged, as a safety net
             let flag = if force { "-D" } else { "-d" };
             match git(&plan.repo.path, &["branch", flag, branch]) {
                 Ok(_) => {
